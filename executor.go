@@ -156,7 +156,11 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 				return e.unknown(ctx, &cm, r, "IssuedJobMissing")
 			}
 			if err == nil {
-				if !validJob(&job, r, cm.Name, ref) || job.Spec.Suspend == nil || !*job.Spec.Suspend {
+				if !validJob(&job, r, cm.Name, ref) {
+					return e.unknown(ctx, &cm, r, "JobIdentityChanged")
+				}
+				r.JobUID = job.UID
+				if job.Spec.Suspend == nil || !*job.Spec.Suspend || executionObserved(&job, r) {
 					return e.unknown(ctx, &cm, r, "SupersededExecutionMayHaveStarted")
 				}
 				if err = e.client.Delete(ctx, &job, client.Preconditions{UID: &job.UID, ResourceVersion: &job.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
@@ -267,6 +271,11 @@ func validJob(job *batchv1.Job, r receipt, recordName string, owner metav1.Owner
 	return sameOwner(job, owner) && job.Annotations[fingerprintAnnotation] == r.Fingerprint && job.Labels[recordLabel] == recordName && job.UID != "" && job.DeletionTimestamp == nil && (r.JobUID == "" || job.UID == r.JobUID)
 }
 
+func executionObserved(job *batchv1.Job, r receipt) bool {
+	status := job.Status
+	return r.PodUID != "" || status.StartTime != nil || status.Active > 0 || status.Succeeded > 0 || status.Failed > 0 || ptr.Deref(status.Terminating, 0) > 0 || status.UncountedTerminatedPods != nil && (len(status.UncountedTerminatedPods.Succeeded) > 0 || len(status.UncountedTerminatedPods.Failed) > 0)
+}
+
 func (e *Executor) save(ctx context.Context, cm *corev1.ConfigMap, r receipt) (Result, error) {
 	before := cm.DeepCopy()
 	data, _ := json.Marshal(r)
@@ -343,6 +352,7 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 		return e.unknown(ctx, cm, r, "JobIdentityChanged")
 	}
 	if !r.Dispatched && (job.Spec.Suspend == nil || !*job.Spec.Suspend) {
+		r.JobUID = job.UID
 		return e.unknown(ctx, cm, r, "JobStartedWithoutReceipt")
 	}
 	if r.JobUID == "" {
@@ -350,7 +360,7 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 		return e.save(ctx, cm, r)
 	}
 	if job.Spec.Suspend != nil && *job.Spec.Suspend {
-		if r.PodUID != "" || job.Status.StartTime != nil || job.Status.Active > 0 || job.Status.Succeeded > 0 || job.Status.Failed > 0 {
+		if executionObserved(&job, r) {
 			return e.unknown(ctx, cm, r, "ObservedExecutionSuspended")
 		}
 		if !authorize || template == nil {

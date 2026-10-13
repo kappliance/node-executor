@@ -174,7 +174,8 @@ revision and execution identities, even if a concurrent writer has already advan
 the primary receipt. `Result.ObservedPods` preserves up to two Pod references when
 multiple Pods caused the ambiguity. Once persisted, the snapshot takes precedence
 over successful primary outcomes and newer revisions. It cannot retract an outcome
-already returned or stop a Job already released before it was persisted.
+already returned or atomically cancel dispatch that was already authorized before
+the snapshot was persisted. ConfigMap and Job writes are separate operations.
 
 An execution whose Pod or start has been observed is never automatically released
 again if its Job is unexpectedly suspended.

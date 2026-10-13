@@ -654,3 +654,70 @@ func TestUnknownPatchLostReplyUsesVerifiedReadback(t *testing.T) {
 		t.Fatalf("uncertainty readback failed: %+v, %v", r, err)
 	}
 }
+
+func TestSuspendedExecutionEvidenceBlocksReleaseAndSuperseding(t *testing.T) {
+	for _, supersede := range []bool{false, true} {
+		for _, evidence := range []string{"start", "terminating", "uncounted-success", "uncounted-failure"} {
+			t.Run(map[bool]string{false: "release", true: "supersede"}[supersede]+"/"+evidence, func(t *testing.T) {
+				f := setup(t)
+				var job *batchv1.Job
+				if supersede {
+					for range 2 {
+						f.reconcile(t)
+					}
+					job = f.job(t)
+				} else {
+					job = f.start(t)
+					job.Spec.Suspend = ptr.To(true)
+					if err := f.client.Update(context.Background(), job); err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch evidence {
+				case "start":
+					now := metav1.Now()
+					job.Status.StartTime = &now
+				case "terminating":
+					job.Status.Terminating = ptr.To[int32](1)
+				case "uncounted-success":
+					job.Status.UncountedTerminatedPods = &batchv1.UncountedTerminatedPods{Succeeded: []types.UID{"observed-pod"}}
+				case "uncounted-failure":
+					job.Status.UncountedTerminatedPods = &batchv1.UncountedTerminatedPods{Failed: []types.UID{"observed-pod"}}
+				}
+				if err := f.client.Status().Update(context.Background(), job); err != nil {
+					t.Fatal(err)
+				}
+				if supersede {
+					f.op.Revision = "v2"
+				}
+				if r := f.reconcile(t); r.Phase != Unknown || r.Job.UID != job.UID {
+					t.Fatalf("observed suspended execution was accepted: %+v", r)
+				}
+				if !*f.job(t).Spec.Suspend {
+					t.Fatal("job was released again")
+				}
+			})
+		}
+	}
+}
+
+func TestUnboundStartedJobRetainsObservedUID(t *testing.T) {
+	f := setup(t)
+	for range 2 {
+		f.reconcile(t)
+	}
+	job := f.job(t)
+	job.Spec.Suspend = ptr.To(false)
+	if err := f.client.Update(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.reconcile(t); r.Phase != Unknown || r.Job.UID != job.UID {
+		t.Fatalf("validated execution identity lost: %+v", r)
+	}
+	if err := f.client.Delete(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.reconcile(t); r.Phase != Unknown || r.Job.UID != job.UID {
+		t.Fatalf("retained uncertainty lost identity: %+v", r)
+	}
+}

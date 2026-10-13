@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -142,5 +143,27 @@ func TestAPIDispatchAndReceiptConflict(t *testing.T) {
 	f.op.Revision = "v2"
 	if result := f.reconcile(t); result.Phase != Unknown || result.Revision != "v1" {
 		t.Fatalf("uncertainty was not authoritative: %+v", result)
+	}
+
+	// A distinct operation exercises suspended execution evidence before UID binding.
+	f.op.Name = "suspension-check"
+	var pending Result
+	for range 2 {
+		pending = f.reconcile(t)
+	}
+	suspendedExecution := &batchv1.Job{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: pending.Job.Namespace, Name: pending.Job.Name}, suspendedExecution); err != nil {
+		t.Fatal(err)
+	}
+	suspendedExecution.Status.Terminating = ptr.To[int32](1)
+	if err := c.Status().Update(ctx, suspendedExecution); err != nil {
+		t.Fatal(err)
+	}
+	f.op.Revision = "v3"
+	if result := f.reconcile(t); result.Phase != Unknown || result.Job.UID != suspendedExecution.UID {
+		t.Fatalf("executed suspended Job was superseded: %+v", result)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(suspendedExecution), suspendedExecution); err != nil || !*suspendedExecution.Spec.Suspend {
+		t.Fatalf("suspended predecessor was removed or released: %v", err)
 	}
 }
