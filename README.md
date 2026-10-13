@@ -27,9 +27,7 @@ Jobs use suspension and `podReplacementPolicy: Failed`; the API integration test
 uses Kubernetes 1.35. The binary helper targets Linux nodes and must match their
 CPU architecture. No CRD or additional controller installation is required.
 
-Fetch the library from a revision that contains the implementation. This repository
-is private: use your organization's Git credentials and set
-`GOPRIVATE=github.com/kappliance/*` when resolving its module.
+Fetch the library from the public repository at a chosen commit or tag:
 
 ```sh
 go get github.com/kappliance/node-executor@<commit-or-tag>
@@ -69,7 +67,7 @@ if run.Phase == nodeexec.Unknown {
     // Persist a condition, stop automatic rollout, and resolve external effects.
     return ctrl.Result{}, nil
 }
-if run.Revision != operation.Revision && run.Done() {
+if run.Revision != operation.Revision && run.Done() && !operation.Cancel {
     return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 if run.Revision != operation.Revision || !run.Done() {
@@ -81,12 +79,26 @@ if run.Revision != operation.Revision || !run.Done() {
 return ctrl.Result{}, nil
 ```
 
-For a completed predecessor returned during a revision change, requeue once so the
-next reconciliation records the new revision. The
+For a completed predecessor returned during an authorized revision change, requeue
+once so the next reconciliation records the new revision. The
 [compilable integration example](examples/controller/reconcile.go) includes this
 case. `Pending` and `Running` provide a five-second requeue. `Succeeded`, `Failed`,
 and `Unknown` stop polling. A running predecessor finishes before a new revision
 can start; `Unknown` blocks both replay and newer revisions.
+
+Set `Operation.Cancel = true` when your controller withdraws launch authorization,
+including when its reservation expires. `Cancel` is excluded from the execution
+fingerprint, so it needs no revision change and does not replace the recorded
+template or revision. Keep the same owner, node identity, and operation name.
+
+An operation with no dispatch or execution evidence returns terminal
+`Failed / CancelledBeforeDispatch`, retaining any created Job's reference and
+leaving it suspended. A dispatched Job still suspended returns sticky
+`Unknown / AuthorizationCancelledDuringDispatch`; the SDK never releases it after
+cancellation. An already released Job remains observable through process completion.
+Cancellation never stops processes or replaces terminal or `Unknown` evidence,
+including a predecessor's receipt, and never starts a newer requested revision.
+The caller computes `Cancel` on each reconciliation; the SDK has no expiry clock.
 
 Watch owned `batchv1.Job` and `corev1.ConfigMap` objects on your controller for
 prompt updates. Register `corev1` and `batchv1` in its scheme. Grant the controller:
@@ -186,7 +198,7 @@ Clearing `unknown.json` is also not a safe reset.
 Restrict other writers in the execution namespace. Terminal Jobs and Pods can be
 cleaned up after their outcome is persisted. Jobs from previous revisions are not
 automatically garbage-collected while their owner exists. The caller owns cleanup,
-deletion handling, cancellation, and any explicit retry after a known failure.
+deletion handling, launch authorization, and any explicit retry after a known failure.
 
 Node UID is checked before dispatch and while observing. Scheduling still uses the
 node's name, so this does not fence a delayed or already-running process against a
