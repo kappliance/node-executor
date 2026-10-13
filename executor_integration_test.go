@@ -34,7 +34,7 @@ func TestAPIDispatchAndReceiptConflict(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	c, err := client.New(config, client.Options{Scheme: scheme(t)})
+	c, err := client.NewWithWatch(config, client.Options{Scheme: scheme(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +204,33 @@ func TestAPIDispatchAndReceiptConflict(t *testing.T) {
 				cancelled.op.Template = Command(image, "/different-command")
 				if result := cancelled.reconcile(t); result.Phase != want || result.Reason != reason || result.Revision != "v1" {
 					t.Fatalf("cancelled revision replaced original receipt: %+v", result)
+				}
+			})
+		}
+	})
+	t.Run("late-job-cancellation", func(t *testing.T) {
+		for _, cancel := range []bool{false, true} {
+			t.Run(map[bool]string{false: "normal", true: "cancel"}[cancel], func(t *testing.T) {
+				cancelled := f
+				cancelled.op.Name, cancelled.op.Revision = "late-job-"+map[bool]string{false: "normal", true: "cancel"}[cancel], "v1"
+				cancelled.reconcile(t)
+				job := cancelled.createJobAfterCancellation(t)
+				_, before := cancelled.receipt(t)
+				cancelled.op.Cancel, cancelled.op.Revision = cancel, "v2"
+				cancelled.op.Template = Command(image, "/new-command")
+				result := cancelled.reconcile(t)
+				_, bound := cancelled.receipt(t)
+				var after batchv1.Job
+				jobErr := c.Get(ctx, client.ObjectKeyFromObject(job), &after)
+				if result.Phase != Failed || result.Reason != "CancelledBeforeDispatch" || result.Revision != "v1" || result.Job.UID != job.UID || bound.JobUID != job.UID || bound.Fingerprint != before.Fingerprint || bound.Sequence != before.Sequence || jobErr != nil || after.ResourceVersion != job.ResourceVersion || !ptr.Deref(after.Spec.Suspend, false) {
+					t.Fatalf("late Job was not bound without replay or replacement: %+v, %v", result, jobErr)
+				}
+				if err := c.Delete(ctx, job, client.Preconditions{UID: &result.Job.UID}); err != nil {
+					t.Fatal(err)
+				}
+				cancelled.op.Cancel = true
+				if again := cancelled.reconcile(t); again.Phase != Failed || again.Reason != result.Reason || again.Job.UID != result.Job.UID || again.Revision != "v1" {
+					t.Fatalf("cleanup replaced terminal cancellation: %+v", again)
 				}
 			})
 		}

@@ -127,6 +127,13 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 	if uncertain != nil {
 		return uncertain.result(e.namespace), nil
 	}
+	if r.Phase == Failed && r.Reason == "CancelledBeforeDispatch" && r.JobUID == "" {
+		// A concurrent authorized reconcile may create a suspended Job after cancellation.
+		observed, err := e.observe(ctx, owner, &cm, r, ref, nil, false, true)
+		if err != nil || observed.Phase != Failed || observed.Job.UID != "" {
+			return observed, err
+		}
+	}
 	if operation.Cancel && (r.Phase == Succeeded || r.Phase == Failed || r.Phase == Unknown) {
 		return r.result(e.namespace), nil
 	}

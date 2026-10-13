@@ -339,6 +339,135 @@ func TestInitialCancellationReadsConcurrentlyCreatedReceipt(t *testing.T) {
 	}
 }
 
+func (f fixture) createJobAfterCancellation(t *testing.T) *batchv1.Job {
+	t.Helper()
+	competed := false
+	writer := interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*batchv1.Job); ok && !competed {
+				competed = true
+				cancelled := f
+				cancelled.op.Cancel = true
+				if r := cancelled.reconcile(t); r.Phase != Failed || r.Reason != "CancelledBeforeDispatch" || r.Job.UID != "" {
+					t.Fatalf("cancellation did not precede Job creation: %+v", r)
+				}
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	if _, err := New(writer, f.client, "operations").Reconcile(context.Background(), f.owner, f.op); err != nil || !competed {
+		t.Fatalf("Job creation race was not exercised: %v", err)
+	}
+	_, unbound := f.receipt(t)
+	var job batchv1.Job
+	if err := f.client.Get(context.Background(), client.ObjectKey{Namespace: "operations", Name: unbound.JobName}, &job); err != nil {
+		t.Fatal(err)
+	}
+	if unbound.Phase != Failed || unbound.JobUID != "" || !ptr.Deref(job.Spec.Suspend, false) {
+		t.Fatalf("late Job was not left suspended and unbound: %+v", unbound)
+	}
+	return &job
+}
+
+func TestCancellationBindsConcurrentlyCreatedJob(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		for _, revision := range []string{"v1", "v2"} {
+			t.Run(map[bool]string{false: "normal", true: "cancel"}[cancel]+"/"+revision, func(t *testing.T) {
+				f := setup(t)
+				f.reconcile(t)
+				_, original := f.receipt(t)
+				job := f.createJobAfterCancellation(t)
+				_, unbound := f.receipt(t)
+				f.op.Cancel, f.op.Revision = cancel, revision
+				if revision != original.Revision {
+					f.op.Template = Command(image, "/new-command")
+				}
+				result := f.reconcile(t)
+				if result.Phase != Failed || result.Reason != "CancelledBeforeDispatch" || result.Revision != original.Revision || result.Job.UID != job.UID {
+					t.Fatalf("late Job identity was not retained: %+v", result)
+				}
+				_, bound := f.receipt(t)
+				unbound.JobUID = job.UID
+				if !reflect.DeepEqual(bound, unbound) || bound.Fingerprint != original.Fingerprint || !reflect.DeepEqual(job, f.job(t)) {
+					t.Fatalf("binding changed cancellation evidence or Job: %+v", bound)
+				}
+				if err := f.client.Delete(context.Background(), job, client.Preconditions{UID: &result.Job.UID}); err != nil {
+					t.Fatal(err)
+				}
+				f.op.Cancel = true
+				if again := f.reconcile(t); !reflect.DeepEqual(again, result) {
+					t.Fatalf("cleanup replaced terminal cancellation: %+v", again)
+				}
+			})
+		}
+	}
+}
+
+func TestCancellationValidatesLateJobEvidence(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		for _, scenario := range []string{"owner", "fingerprint", "record", "unsuspended", "executed"} {
+			t.Run(map[bool]string{false: "normal", true: "cancel"}[cancel]+"/"+scenario, func(t *testing.T) {
+				f := setup(t)
+				f.reconcile(t)
+				job := f.createJobAfterCancellation(t)
+				before, _ := f.receipt(t)
+				want := "JobIdentityChanged"
+				switch scenario {
+				case "owner":
+					job.OwnerReferences[0].UID = "other-owner"
+				case "fingerprint":
+					job.Annotations[fingerprintAnnotation] = "changed"
+				case "record":
+					job.Labels[recordLabel] = "other-receipt"
+				case "unsuspended":
+					job.Spec.Suspend = ptr.To(false)
+					want = "JobStartedWithoutReceipt"
+				case "executed":
+					job.Status.Active = 1
+					want = "ObservedExecutionSuspended"
+				}
+				if scenario == "executed" {
+					if err := f.client.Status().Update(context.Background(), job); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := f.client.Update(context.Background(), job); err != nil {
+					t.Fatal(err)
+				}
+				f.op.Cancel, f.op.Revision = cancel, "v2"
+				result := f.reconcile(t)
+				after, _ := f.receipt(t)
+				if result.Phase != Unknown || result.Reason != want || result.Revision != "v1" || after.Data["receipt.json"] != before.Data["receipt.json"] || !reflect.DeepEqual(job, f.job(t)) {
+					t.Fatalf("late Job evidence was not validated or terminal receipt changed: %+v", result)
+				}
+				if again := f.reconcile(t); !reflect.DeepEqual(again, result) {
+					t.Fatalf("late Job uncertainty was replaced: %+v", again)
+				}
+			})
+		}
+	}
+}
+
+func TestCancellationWithoutJobAllowsNewRevision(t *testing.T) {
+	for steps, stage := range []string{"initial", "receipt-only"} {
+		t.Run(stage, func(t *testing.T) {
+			f := setup(t)
+			for range steps {
+				f.reconcile(t)
+			}
+			f.op.Cancel = true
+			cancelled := f.reconcile(t)
+			_, original := f.receipt(t)
+			f.op.Cancel, f.op.Revision = false, "v2"
+			f.op.Template = Command(image, "/new-command")
+			job := f.start(t)
+			_, current := f.receipt(t)
+			if cancelled.Phase != Failed || cancelled.Job.UID != "" || current.Revision != "v2" || current.Sequence != original.Sequence+1 || current.JobName == original.JobName || current.JobUID != job.UID || !current.Dispatched {
+				t.Fatalf("cancellation blocked a new revision: %+v", current)
+			}
+		})
+	}
+}
+
 func TestCancellationPreservesExistingUnknownEvidence(t *testing.T) {
 	f := setup(t)
 	job := f.start(t)
