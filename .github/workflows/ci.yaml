@@ -1,0 +1,30 @@
+name: Checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: true
+      - name: Install API test assets
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/envtest.tar.gz" https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.35.0/envtest-v1.35.0-linux-amd64.tar.gz
+          echo "130369c16f076e724d089189afaede960316f5f5dea6cf57be7a4fc6f09c77342893192509790e4056e116e232dff832ed863f5bd55dcb55d38f3ab834828a11  $RUNNER_TEMP/envtest.tar.gz" | sha512sum --check
+          mkdir "$RUNNER_TEMP/envtest"
+          tar -xzf "$RUNNER_TEMP/envtest.tar.gz" -C "$RUNNER_TEMP/envtest" --strip-components=2
+          echo "KUBEBUILDER_ASSETS=$RUNNER_TEMP/envtest" >> "$GITHUB_ENV"
+      - name: Check module and formatting
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(gofmt -l .)"
+      - run: make test test-api vet build
+      - run: docker build -t node-executor:test .
