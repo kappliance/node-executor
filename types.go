@@ -14,6 +14,10 @@ type Operation struct {
 	Revision string
 	Node     corev1.ObjectReference
 	Template corev1.PodTemplateSpec
+	// Cancel withdraws launch authorization without stopping dispatched processes.
+	// It does not change execution identity or replace terminal/unknown evidence,
+	// including a predecessor's receipt when Revision has changed.
+	Cancel bool
 }
 
 type Phase string
@@ -27,7 +31,7 @@ const (
 )
 
 // Result describes transport execution, not proof of external host commit.
-// Revision may be an unresolved predecessor of the requested revision.
+// Revision may be a predecessor of the requested revision, including when cancelled.
 type Result struct {
 	Phase    Phase
 	Revision string

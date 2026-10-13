@@ -166,4 +166,46 @@ func TestAPIDispatchAndReceiptConflict(t *testing.T) {
 	if err := c.Get(ctx, client.ObjectKeyFromObject(suspendedExecution), suspendedExecution); err != nil || !*suspendedExecution.Spec.Suspend {
 		t.Fatalf("suspended predecessor was removed or released: %v", err)
 	}
+
+	t.Run("cancellation", func(t *testing.T) {
+		for steps, stage := range []string{"initial", "receipt-only", "unbound-job", "bound-job", "dispatch-marked"} {
+			t.Run(stage, func(t *testing.T) {
+				cancelled := f
+				cancelled.op.Name, cancelled.op.Revision = "cancel-"+stage, "v1"
+				var before Result
+				for range steps {
+					before = cancelled.reconcile(t)
+				}
+				var job batchv1.Job
+				if steps >= 2 {
+					if err := c.Get(ctx, client.ObjectKey{Namespace: ns.Name, Name: before.Job.Name}, &job); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cancelled.op.Cancel = true
+				result := cancelled.reconcile(t)
+				want, reason := Failed, "CancelledBeforeDispatch"
+				if steps == 4 {
+					want, reason = Unknown, "AuthorizationCancelledDuringDispatch"
+				}
+				if result.Phase != want || result.Reason != reason || result.Revision != "v1" {
+					t.Fatalf("unexpected cancellation: %+v", result)
+				}
+				var after batchv1.Job
+				jobErr := c.Get(ctx, client.ObjectKey{Namespace: ns.Name, Name: result.Job.Name}, &after)
+				if steps < 2 {
+					if !apierrors.IsNotFound(jobErr) {
+						t.Fatalf("cancelled operation created a Job: %v", jobErr)
+					}
+				} else if jobErr != nil || after.UID != job.UID || after.ResourceVersion != job.ResourceVersion || !ptr.Deref(after.Spec.Suspend, false) || result.Job.UID != job.UID {
+					t.Fatalf("cancellation modified Job or lost identity: %+v, %v", result, jobErr)
+				}
+				cancelled.op.Revision = "v2"
+				cancelled.op.Template = Command(image, "/different-command")
+				if result := cancelled.reconcile(t); result.Phase != want || result.Reason != reason || result.Revision != "v1" {
+					t.Fatalf("cancelled revision replaced original receipt: %+v", result)
+				}
+			})
+		}
+	})
 }

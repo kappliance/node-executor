@@ -22,7 +22,7 @@ func ReconcileWork(ctx context.Context, executor *nodeexec.Executor, owner clien
 		return ctrl.Result{}, run, nil
 	}
 	if run.Revision != operation.Revision {
-		if run.Done() {
+		if run.Done() && !operation.Cancel {
 			return ctrl.Result{RequeueAfter: time.Second}, run, nil
 		}
 		return run.Result, run, nil

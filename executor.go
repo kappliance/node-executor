@@ -91,6 +91,9 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 	}{operation.Revision, operation.Node, template})
 	desired := receipt{Version: 1, Name: operation.Name, OwnerUID: owner.GetUID(), Node: operation.Node, Revision: operation.Revision, Fingerprint: fingerprint,
 		Sequence: 1, JobName: jobName(key.Name, fingerprint, 1), Phase: Pending}
+	if operation.Cancel {
+		desired.Phase, desired.Reason = Failed, "CancelledBeforeDispatch"
+	}
 	var cm corev1.ConfigMap
 	if err = e.reader.Get(ctx, key, &cm); apierrors.IsNotFound(err) {
 		if live.GetDeletionTimestamp() != nil {
@@ -104,7 +107,12 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 		if err = e.client.Create(ctx, &cm); err != nil && !apierrors.IsAlreadyExists(err) {
 			return Result{}, err
 		}
-		return desired.result(e.namespace), nil
+		if !operation.Cancel || !apierrors.IsAlreadyExists(err) {
+			return desired.result(e.namespace), nil
+		}
+		if err := e.reader.Get(ctx, key, &cm); err != nil {
+			return Result{}, err
+		}
 	} else if err != nil {
 		return Result{}, err
 	}
@@ -119,17 +127,23 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 	if uncertain != nil {
 		return uncertain.result(e.namespace), nil
 	}
+	if operation.Cancel && (r.Phase == Succeeded || r.Phase == Failed || r.Phase == Unknown) {
+		return r.result(e.namespace), nil
+	}
 	if cm.DeletionTimestamp != nil {
 		if r.Dispatched && !r.result(e.namespace).Done() {
 			return e.unknown(ctx, &cm, r, "ExecutionReceiptDeleting")
 		}
 		return Result{}, errors.New("deleting execution receipt cannot authorize dispatch")
 	}
-	if r.Revision == desired.Revision && r.Fingerprint != desired.Fingerprint {
+	if !operation.Cancel && r.Revision == desired.Revision && r.Fingerprint != desired.Fingerprint {
 		return Result{}, errors.New("operation template changed without changing its revision")
 	}
 	if r.Phase == Unknown {
 		return r.result(e.namespace), nil
+	}
+	if operation.Cancel {
+		return e.observe(ctx, owner, &cm, r, ref, nil, false, true)
 	}
 	if r.Revision != desired.Revision {
 		if r.Phase == Succeeded || r.Phase == Failed {
@@ -170,7 +184,7 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 			r.Phase, r.Reason = Failed, "SupersededBeforeDispatch"
 			return e.save(ctx, &cm, r)
 		}
-		return e.observe(ctx, owner, &cm, r, ref, nil, false)
+		return e.observe(ctx, owner, &cm, r, ref, nil, false, false)
 	}
 	if r.Phase == Succeeded || r.Phase == Failed {
 		return r.result(e.namespace), nil
@@ -179,7 +193,7 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 		r.Phase, r.Reason = Failed, "OwnerDeletingBeforeDispatch"
 		return e.save(ctx, &cm, r)
 	}
-	return e.observe(ctx, owner, &cm, r, ref, &template, live.GetDeletionTimestamp() == nil)
+	return e.observe(ctx, owner, &cm, r, ref, &template, live.GetDeletionTimestamp() == nil, false)
 }
 
 func (e *Executor) liveOwner(ctx context.Context, owner client.Object) (client.Object, error) {
@@ -324,12 +338,16 @@ func (e *Executor) unknown(ctx context.Context, cm *corev1.ConfigMap, r receipt,
 	return r.result(e.namespace), nil
 }
 
-func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.ConfigMap, r receipt, ref metav1.OwnerReference, template *corev1.PodTemplateSpec, authorize bool) (Result, error) {
+func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.ConfigMap, r receipt, ref metav1.OwnerReference, template *corev1.PodTemplateSpec, authorize, cancel bool) (Result, error) {
 	var job batchv1.Job
 	key := client.ObjectKey{Namespace: e.namespace, Name: r.JobName}
 	if err := e.reader.Get(ctx, key, &job); apierrors.IsNotFound(err) {
 		if r.Dispatched || r.JobUID != "" {
 			return e.unknown(ctx, cm, r, "IssuedJobMissing")
+		}
+		if cancel {
+			r.Phase, r.Reason = Failed, "CancelledBeforeDispatch"
+			return e.save(ctx, cm, r)
 		}
 		if template == nil || !authorize {
 			return r.result(e.namespace), nil
@@ -355,11 +373,22 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 		r.JobUID = job.UID
 		return e.unknown(ctx, cm, r, "JobStartedWithoutReceipt")
 	}
+	if cancel && !r.Dispatched {
+		r.JobUID = job.UID
+		if executionObserved(&job, r) {
+			return e.unknown(ctx, cm, r, "ObservedExecutionSuspended")
+		}
+		r.Phase, r.Reason = Failed, "CancelledBeforeDispatch"
+		return e.save(ctx, cm, r)
+	}
 	if r.JobUID == "" {
 		r.JobUID = job.UID
 		return e.save(ctx, cm, r)
 	}
 	if job.Spec.Suspend != nil && *job.Spec.Suspend {
+		if cancel {
+			return e.unknown(ctx, cm, r, "AuthorizationCancelledDuringDispatch")
+		}
 		if executionObserved(&job, r) {
 			return e.unknown(ctx, cm, r, "ObservedExecutionSuspended")
 		}
