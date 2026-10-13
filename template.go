@@ -29,7 +29,8 @@ func Command(image string, argv ...string) corev1.PodTemplateSpec {
 			SecurityContext: &corev1.SecurityContext{
 				RunAsUser: ptr.To[int64](65532), RunAsNonRoot: ptr.To(true),
 				AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true),
-				Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				Capabilities:   &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 		}},
 	}}
@@ -136,11 +137,17 @@ func normalize(operation Operation) (corev1.PodTemplateSpec, error) {
 	}
 	selector := template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
 	if selector == nil {
-		selector = &corev1.NodeSelector{}
+		selector = &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{}}}
 		template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = selector
-	}
-	if len(selector.NodeSelectorTerms) == 0 {
-		selector.NodeSelectorTerms = []corev1.NodeSelectorTerm{{}}
+	} else {
+		if len(selector.NodeSelectorTerms) == 0 {
+			return corev1.PodTemplateSpec{}, errors.New("required node affinity must contain nonempty terms")
+		}
+		for _, term := range selector.NodeSelectorTerms {
+			if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
+				return corev1.PodTemplateSpec{}, errors.New("required node affinity must contain nonempty terms")
+			}
+		}
 	}
 	for index := range selector.NodeSelectorTerms {
 		selector.NodeSelectorTerms[index].MatchFields = append(selector.NodeSelectorTerms[index].MatchFields, corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{operation.Node.Name}})

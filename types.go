@@ -34,7 +34,9 @@ type Result struct {
 	Reason   string
 	Job      corev1.ObjectReference
 	Pod      corev1.ObjectReference
-	Result   ctrl.Result
+	// ObservedPods retains up to two identities when multiple Pods caused Unknown.
+	ObservedPods []corev1.ObjectReference
+	Result       ctrl.Result
 }
 
 func (r Result) Done() bool { return r.Phase == Succeeded || r.Phase == Failed }

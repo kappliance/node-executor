@@ -42,6 +42,16 @@ func TestContainerRestartOverridesAreRejected(t *testing.T) {
 	}
 }
 
+func TestSuppliedEmptyAffinityTermsAreRejected(t *testing.T) {
+	for _, terms := range [][]corev1.NodeSelectorTerm{nil, {{}}, {{}, {MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"approved"}}}}}} {
+		f := setup(t)
+		f.op.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: terms}}}
+		if _, err := normalize(f.op); err == nil {
+			t.Fatal("empty affinity broadened caller's node selection")
+		}
+	}
+}
+
 func TestInvalidInstallInputs(t *testing.T) {
 	valid := Binary{Image: image, HelperImage: image, Source: "/payload/tool", Destination: "/opt/tools/tool", SHA256: strings.Repeat("a", 64)}
 	for _, mutate := range []func(*Binary){func(b *Binary) { b.Image = "repo:latest" }, func(b *Binary) { b.HelperImage = "repo:latest" }, func(b *Binary) { b.SHA256 = "bad" }, func(b *Binary) { b.PreviousSHA256 = "bad" }, func(b *Binary) { b.Destination = "/opt/../etc/tool" }, func(b *Binary) { b.Source = "../tool" }} {

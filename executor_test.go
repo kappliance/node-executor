@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -377,7 +378,7 @@ func TestDeletingReceiptCannotDispatch(t *testing.T) {
 }
 
 func TestInvalidReceiptFailsClosed(t *testing.T) {
-	for _, invalid := range []string{"unknown-field", "trailing-json", "inconsistent-evidence", "invalid-owner"} {
+	for _, invalid := range []string{"unknown-field", "trailing-json", "inconsistent-evidence", "invalid-owner", "invalid-uncertainty", "missing-uncertainty", "wrong-outcome-uncertainty"} {
 		t.Run(invalid, func(t *testing.T) {
 			f := setup(t)
 			f.reconcile(t)
@@ -403,6 +404,12 @@ func TestInvalidReceiptFailsClosed(t *testing.T) {
 				cm.Data["receipt.json"] = string(data)
 			case "invalid-owner":
 				cm.OwnerReferences[0].UID = "other"
+			case "invalid-uncertainty":
+				cm.Data["unknown.json"] = "not-json"
+			case "missing-uncertainty":
+				delete(cm.Data, "unknown.json")
+			case "wrong-outcome-uncertainty":
+				cm.Data["unknown.json"] = cm.Data["receipt.json"]
 			}
 			if err := f.client.Update(context.Background(), &cm); err != nil {
 				t.Fatal(err)
@@ -454,4 +461,196 @@ func TestNodeReferenceIgnoresObservedResourceVersion(t *testing.T) {
 	f.reconcile(t)
 	f.op.Node.ResourceVersion = "124"
 	f.reconcile(t)
+}
+
+func TestSupersedingCannotDeleteConcurrentlyStartedJob(t *testing.T) {
+	f := setup(t)
+	for range 3 {
+		f.reconcile(t)
+	}
+	job := f.job(t)
+	writer := interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			// Another valid reconciliation persists dispatch and releases the Job
+			// after the superseding reconciliation observed its suspended state.
+			for range 2 {
+				if _, err := f.executor.Reconcile(ctx, f.owner, f.op); err != nil {
+					return err
+				}
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	next := f.op
+	next.Revision = "v2"
+	_, err := New(writer, f.client, "operations").Reconcile(context.Background(), f.owner, next)
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("stale suspended-Job deletion returned %v", err)
+	}
+	if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(job), job); err != nil || job.Spec.Suspend == nil || *job.Spec.Suspend {
+		t.Fatalf("started Job was removed: %+v, %v", job, err)
+	}
+	result, err := f.executor.Reconcile(context.Background(), f.owner, next)
+	if err != nil || result.Revision != "v1" || result.Phase != Pending {
+		t.Fatalf("predecessor was not retained: %+v, %v", result, err)
+	}
+}
+
+func TestSupersedingInspectsUnboundAndMissingJobs(t *testing.T) {
+	for _, scenario := range []string{"unbound-started", "unbound-suspended", "bound-missing"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := setup(t)
+			for range 2 {
+				f.reconcile(t)
+			}
+			job := f.job(t)
+			want := Unknown
+			switch scenario {
+			case "unbound-started":
+				// Creation admission or another writer released the Job before binding.
+				job.Spec.Suspend = ptr.To(false)
+				if err := f.client.Update(context.Background(), job); err != nil {
+					t.Fatal(err)
+				}
+			case "unbound-suspended":
+				want = Failed
+			case "bound-missing":
+				f.reconcile(t)
+				if err := f.client.Delete(context.Background(), job); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.op.Revision = "v2"
+			if r := f.reconcile(t); r.Phase != want || r.Revision != "v1" {
+				t.Fatalf("%+v", r)
+			}
+			if want == Unknown {
+				for range 2 {
+					if r := f.reconcile(t); r.Phase != Unknown || r.Revision != "v1" {
+						t.Fatalf("uncertain work was replaced: %+v", r)
+					}
+				}
+			} else {
+				if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("old suspended Job was retained: %v", err)
+				}
+				if r := f.reconcile(t); r.Revision != "v2" || r.Phase != Pending {
+					t.Fatalf("%+v", r)
+				}
+			}
+		})
+	}
+}
+
+func TestObservedSuspendedJobIsNeverReleasedAgain(t *testing.T) {
+	f := setup(t)
+	job := f.start(t)
+	pod := f.pod(t, job, corev1.PodRunning)
+	f.reconcile(t)
+	f.reconcile(t)
+	job.Spec.Suspend = ptr.To(true)
+	if err := f.client.Update(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.client.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.reconcile(t); r.Phase != Unknown || r.Reason != "ObservedExecutionSuspended" {
+		t.Fatalf("%+v", r)
+	}
+	if !*f.job(t).Spec.Suspend {
+		t.Fatal("previously observed execution was released again")
+	}
+}
+
+func TestUncertaintySurvivesConcurrentSuccessAndNewRevision(t *testing.T) {
+	f := setup(t)
+	job := f.start(t)
+	pod := f.pod(t, job, corev1.PodSucceeded)
+	f.reconcile(t)
+	extra := pod.DeepCopy()
+	extra.Name, extra.UID, extra.ResourceVersion = pod.Name+"-other", "other-pod", ""
+	if err := f.client.Create(context.Background(), extra); err != nil {
+		t.Fatal(err)
+	}
+	next := f.op
+	next.Revision = "v2"
+	var newJobName string
+	competed := false
+	writer := interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*corev1.ConfigMap); ok && !competed {
+				competed = true
+				if err := c.Delete(ctx, extra); err != nil {
+					return err
+				}
+				if r := f.reconcile(t); r.Phase != Succeeded {
+					t.Fatalf("competitor did not persist success: %+v", r)
+				}
+				for range 2 {
+					r, err := f.executor.Reconcile(ctx, f.owner, next)
+					if err != nil {
+						return err
+					}
+					newJobName = r.Job.Name
+				}
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	r, err := New(writer, f.client, "operations").Reconcile(context.Background(), f.owner, f.op)
+	if err != nil || r.Phase != Unknown || r.Revision != "v1" || len(r.ObservedPods) != 2 {
+		t.Fatalf("lost uncertainty: %+v, %v", r, err)
+	}
+	for range 2 {
+		r, err = f.executor.Reconcile(context.Background(), f.owner, next)
+		if err != nil || r.Phase != Unknown || r.Revision != "v1" {
+			t.Fatalf("advanced primary hid uncertainty: %+v, %v", r, err)
+		}
+	}
+	var newJob batchv1.Job
+	if err := f.client.Get(context.Background(), client.ObjectKey{Namespace: "operations", Name: newJobName}, &newJob); err != nil || newJob.Spec.Suspend == nil || !*newJob.Spec.Suspend {
+		t.Fatalf("new execution was released: %+v, %v", newJob, err)
+	}
+}
+
+func TestUnknownReadbackRetainsFirstEvidence(t *testing.T) {
+	f := setup(t)
+	f.start(t)
+	var cm corev1.ConfigMap
+	if err := f.client.Get(context.Background(), client.ObjectKey{Namespace: "operations", Name: ReceiptName(f.owner.UID, f.op.Node.UID, f.op.Name)}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	r, err := decodeReceipt(&cm, receipt{Name: f.op.Name, OwnerUID: f.owner.UID, Node: f.op.Node}, *metav1.GetControllerOf(&cm))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := cm.DeepCopy()
+	if _, err := f.executor.unknown(context.Background(), &cm, r, "FirstObservation"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.executor.unknown(context.Background(), stale, r, "LaterObservation")
+	if err != nil || result.Phase != Unknown || result.Reason != "FirstObservation" {
+		t.Fatalf("first evidence overwritten: %+v, %v", result, err)
+	}
+}
+
+func TestUnknownPatchLostReplyUsesVerifiedReadback(t *testing.T) {
+	f := setup(t)
+	job := f.start(t)
+	if err := f.client.Delete(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	writer := interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := c.Patch(ctx, obj, patch, opts...); err != nil {
+				return err
+			}
+			return errors.New("reply lost after uncertainty persisted")
+		},
+	})
+	r, err := New(writer, f.client, "operations").Reconcile(context.Background(), f.owner, f.op)
+	if err != nil || r.Phase != Unknown || r.Reason != "IssuedJobMissing" {
+		t.Fatalf("uncertainty readback failed: %+v, %v", r, err)
+	}
 }

@@ -55,6 +55,8 @@ when its desired work changes, including changes to referenced ConfigMaps or Sec
 Use the same template on each reconciliation of a revision. All container images,
 including init containers, must use an `@sha256:` digest reference.
 Container restart overrides and restarting sidecars are rejected.
+Required node-affinity terms must be nonempty; adding a target constraint must
+never turn an empty, non-matching term into a matching one.
 
 Within your reconciler, handle the requested revision and the process outcome:
 
@@ -101,7 +103,8 @@ Node reads require cluster-scoped access. Keep Job and ConfigMap writes scoped t
 the execution namespace. The controller also needs the owner's finalizer permission
 when admission enforces `blockOwnerDeletion`. The library does not create namespaces
 or service accounts. `Command` disables API-token automount, runs as UID 65532, drops
-all capabilities, and makes the image filesystem read-only. Edit the native template
+all capabilities, uses `RuntimeDefault` seccomp, and makes the image filesystem
+read-only. Edit the native template
 when your command deliberately requires different privileges or writable storage.
 
 ## Install a binary
@@ -110,6 +113,7 @@ Build a helper image for the target node architecture:
 
 ```sh
 make image HELPER_IMAGE=registry.example.com/node-executor:local
+# For ARM64 nodes: GOARCH=arm64 make image HELPER_IMAGE=registry.example.com/node-executor:arm64
 ```
 
 Push it to your own registry and obtain its immutable digest before using it.
@@ -149,22 +153,35 @@ before deciding whether another revision is safe.
 
 ```mermaid
 flowchart LR
-    C[Your controller\npolicy and desired revision] --> E[Node Executor\nreconcile]
-    E --> R[ConfigMap receipt\nidentity and outcome]
+    C["Your controller<br/>policy and desired revision"] --> E["Node Executor<br/>reconcile"]
+    E --> R["ConfigMap receipt<br/>identity and outcome"]
     E --> J[Job on selected node]
     J --> P[Command or binary helper]
-    P --> H[Host effects\nverified by your controller]
+    P --> H["Host effects<br/>verified by your controller"]
 ```
 
-A logical operation is keyed by **owner UID + node UID + operation name**. The
+Within the execution namespace, a logical operation is keyed by
+**owner UID + node UID + operation name**. The
 receipt records the revision and immutable request fingerprint. The library creates
 a suspended Job, records its UID and dispatch intent, then unsuspends that same
 Job. Updates use Kubernetes resource-version preconditions. Missing or replaced
 issued Jobs, replaced or multiple observed Pods, or a changed node identity produce
 `Unknown` rather than a replacement execution.
 
+The ConfigMap's `receipt.json` tracks the current execution. Its `unknown.json`
+slot permanently retains the first uncertain observation, including its original
+revision and execution identities, even if a concurrent writer has already advanced
+the primary receipt. `Result.ObservedPods` preserves up to two Pod references when
+multiple Pods caused the ambiguity. Once persisted, the snapshot takes precedence
+over successful primary outcomes and newer revisions. It cannot retract an outcome
+already returned or stop a Job already released before it was persisted.
+
+An execution whose Pod or start has been observed is never automatically released
+again if its Job is unexpectedly suspended.
+
 Keep receipts until the owner's effects have been resolved. Deleting a receipt
 removes the record that prevents replay; it is not a safe way to reset `Unknown`.
+Clearing `unknown.json` is also not a safe reset.
 Restrict other writers in the execution namespace. Terminal Jobs and Pods can be
 cleaned up after their outcome is persisted. Jobs from previous revisions are not
 automatically garbage-collected while their owner exists. The caller owns cleanup,

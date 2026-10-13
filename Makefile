@@ -16,4 +16,4 @@ build:
 	CGO_ENABLED=0 GOOS=linux $(GO) build -trimpath -o bin/node-executor ./cmd/node-executor
 
 image: build
-	docker build -t $(HELPER_IMAGE) .
+	docker build --platform linux/$(shell $(GO) env GOARCH) -t $(HELPER_IMAGE) .

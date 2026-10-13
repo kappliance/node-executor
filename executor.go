@@ -32,24 +32,25 @@ func New(writer client.Client, reader client.Reader, namespace string) *Executor
 }
 
 type receipt struct {
-	Version     int                    `json:"version"`
-	Name        string                 `json:"name"`
-	OwnerUID    types.UID              `json:"ownerUID"`
-	Node        corev1.ObjectReference `json:"node"`
-	Revision    string                 `json:"revision"`
-	Fingerprint string                 `json:"fingerprint"`
-	Sequence    uint64                 `json:"sequence"`
-	JobName     string                 `json:"jobName"`
-	JobUID      types.UID              `json:"jobUID,omitempty"`
-	PodUID      types.UID              `json:"podUID,omitempty"`
-	PodName     string                 `json:"podName,omitempty"`
-	Dispatched  bool                   `json:"dispatched"`
-	Phase       Phase                  `json:"phase"`
-	Reason      string                 `json:"reason,omitempty"`
+	Version      int                      `json:"version"`
+	Name         string                   `json:"name"`
+	OwnerUID     types.UID                `json:"ownerUID"`
+	Node         corev1.ObjectReference   `json:"node"`
+	Revision     string                   `json:"revision"`
+	Fingerprint  string                   `json:"fingerprint"`
+	Sequence     uint64                   `json:"sequence"`
+	JobName      string                   `json:"jobName"`
+	JobUID       types.UID                `json:"jobUID,omitempty"`
+	PodUID       types.UID                `json:"podUID,omitempty"`
+	PodName      string                   `json:"podName,omitempty"`
+	Dispatched   bool                     `json:"dispatched"`
+	Phase        Phase                    `json:"phase"`
+	Reason       string                   `json:"reason,omitempty"`
+	ObservedPods []corev1.ObjectReference `json:"observedPods,omitempty"`
 }
 
 func (r receipt) result(namespace string) Result {
-	result := Result{Phase: r.Phase, Revision: r.Revision, Reason: r.Reason,
+	result := Result{Phase: r.Phase, Revision: r.Revision, Reason: r.Reason, ObservedPods: r.ObservedPods,
 		Job: corev1.ObjectReference{APIVersion: "batch/v1", Kind: "Job", Namespace: namespace, Name: r.JobName, UID: r.JobUID},
 		Pod: corev1.ObjectReference{APIVersion: "v1", Kind: "Pod", Namespace: namespace, Name: r.PodName, UID: r.PodUID}}
 	if !result.Done() && result.Phase != Unknown {
@@ -99,7 +100,7 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 			return Result{}, err
 		}
 		data, _ := json.Marshal(desired)
-		cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, OwnerReferences: []metav1.OwnerReference{ref}, Labels: map[string]string{recordLabel: key.Name}}, Data: map[string]string{"receipt.json": string(data)}}
+		cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, OwnerReferences: []metav1.OwnerReference{ref}, Labels: map[string]string{recordLabel: key.Name}}, Data: map[string]string{"receipt.json": string(data), "unknown.json": ""}}
 		if err = e.client.Create(ctx, &cm); err != nil && !apierrors.IsAlreadyExists(err) {
 			return Result{}, err
 		}
@@ -110,6 +111,13 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 	r, err := decodeReceipt(&cm, desired, ref)
 	if err != nil {
 		return Result{}, err
+	}
+	uncertain, err := decodeUnknown(&cm, desired, ref)
+	if err != nil {
+		return Result{}, err
+	}
+	if uncertain != nil {
+		return uncertain.result(e.namespace), nil
 	}
 	if cm.DeletionTimestamp != nil {
 		if r.Dispatched && !r.result(e.namespace).Done() {
@@ -139,19 +147,20 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 			return e.save(ctx, &cm, desired)
 		}
 		if !r.Dispatched {
-			if r.JobUID != "" {
-				var job batchv1.Job
-				err := e.reader.Get(ctx, client.ObjectKey{Namespace: e.namespace, Name: r.JobName}, &job)
-				if err != nil && !apierrors.IsNotFound(err) {
-					return Result{}, err
+			var job batchv1.Job
+			err := e.reader.Get(ctx, client.ObjectKey{Namespace: e.namespace, Name: r.JobName}, &job)
+			if err != nil && !apierrors.IsNotFound(err) {
+				return Result{}, err
+			}
+			if apierrors.IsNotFound(err) && r.JobUID != "" {
+				return e.unknown(ctx, &cm, r, "IssuedJobMissing")
+			}
+			if err == nil {
+				if !validJob(&job, r, cm.Name, ref) || job.Spec.Suspend == nil || !*job.Spec.Suspend {
+					return e.unknown(ctx, &cm, r, "SupersededExecutionMayHaveStarted")
 				}
-				if err == nil {
-					if job.UID != r.JobUID || job.Spec.Suspend == nil || !*job.Spec.Suspend {
-						return e.unknown(ctx, &cm, r, "SupersededExecutionMayHaveStarted")
-					}
-					if err = e.client.Delete(ctx, &job, client.Preconditions{UID: &job.UID}); err != nil && !apierrors.IsNotFound(err) {
-						return Result{}, err
-					}
+				if err = e.client.Delete(ctx, &job, client.Preconditions{UID: &job.UID, ResourceVersion: &job.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+					return Result{}, err
 				}
 			}
 			r.Phase, r.Reason = Failed, "SupersededBeforeDispatch"
@@ -201,6 +210,14 @@ func decodeReceipt(cm *corev1.ConfigMap, desired receipt, owner metav1.OwnerRefe
 	if r.Dispatched && r.JobUID == "" || (r.PodUID == "") != (r.PodName == "") || r.PodUID != "" && !r.Dispatched || (r.Phase == Running || r.Phase == Succeeded) && r.PodUID == "" {
 		return r, errors.New("execution receipt contains inconsistent dispatch evidence")
 	}
+	if len(r.ObservedPods) > 2 || len(r.ObservedPods) != 0 && r.Phase != Unknown {
+		return r, errors.New("invalid uncertainty Pod evidence")
+	}
+	for _, pod := range r.ObservedPods {
+		if pod.Name == "" || pod.UID == "" || pod.Namespace != cm.Namespace || pod.Kind != "Pod" || pod.APIVersion != "v1" {
+			return r, errors.New("invalid uncertainty Pod identity")
+		}
+	}
 	switch r.Phase {
 	case Pending, Running, Succeeded, Failed, Unknown:
 	default:
@@ -209,9 +226,45 @@ func decodeReceipt(cm *corev1.ConfigMap, desired receipt, owner metav1.OwnerRefe
 	return r, nil
 }
 
+func decodeUnknown(cm *corev1.ConfigMap, identity receipt, owner metav1.OwnerReference) (*receipt, error) {
+	snapshot, ok := cm.Data["unknown.json"]
+	if !ok || !sameOwner(cm, owner) {
+		return nil, errors.New("invalid execution uncertainty slot")
+	}
+	if snapshot == "" {
+		return nil, nil
+	}
+	copy := cm.DeepCopy()
+	copy.Data["receipt.json"] = snapshot
+	r, err := decodeReceipt(copy, identity, owner)
+	if err != nil {
+		return nil, err
+	}
+	if r.Phase != Unknown {
+		return nil, errors.New("invalid execution uncertainty outcome")
+	}
+	return &r, nil
+}
+
+func (e *Executor) readUnknown(ctx context.Context, original *corev1.ConfigMap, identity receipt) (*receipt, error) {
+	var current corev1.ConfigMap
+	if err := e.reader.Get(ctx, client.ObjectKeyFromObject(original), &current); err != nil {
+		return nil, err
+	}
+	owner := metav1.GetControllerOf(original)
+	if current.UID != original.UID || owner == nil {
+		return nil, errors.New("execution receipt identity changed")
+	}
+	return decodeUnknown(&current, identity, *owner)
+}
+
 func sameOwner(object metav1.Object, expected metav1.OwnerReference) bool {
 	owner := metav1.GetControllerOf(object)
 	return owner != nil && owner.UID == expected.UID && owner.Name == expected.Name && owner.Kind == expected.Kind && owner.APIVersion == expected.APIVersion
+}
+
+func validJob(job *batchv1.Job, r receipt, recordName string, owner metav1.OwnerReference) bool {
+	return sameOwner(job, owner) && job.Annotations[fingerprintAnnotation] == r.Fingerprint && job.Labels[recordLabel] == recordName && job.UID != "" && job.DeletionTimestamp == nil && (r.JobUID == "" || job.UID == r.JobUID)
 }
 
 func (e *Executor) save(ctx context.Context, cm *corev1.ConfigMap, r receipt) (Result, error) {
@@ -226,6 +279,13 @@ func (e *Executor) save(ctx context.Context, cm *corev1.ConfigMap, r receipt) (R
 	}
 	if err := e.client.Patch(ctx, cm, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		if apierrors.IsConflict(err) {
+			uncertain, readErr := e.readUnknown(ctx, before, r)
+			if readErr != nil {
+				return Result{}, readErr
+			}
+			if uncertain != nil {
+				return uncertain.result(e.namespace), nil
+			}
 			return Result{Phase: Pending, Result: ctrl.Result{RequeueAfter: pollInterval}}, nil
 		}
 		return Result{}, err
@@ -235,7 +295,24 @@ func (e *Executor) save(ctx context.Context, cm *corev1.ConfigMap, r receipt) (R
 
 func (e *Executor) unknown(ctx context.Context, cm *corev1.ConfigMap, r receipt, reason string) (Result, error) {
 	r.Phase, r.Reason = Unknown, reason
-	return e.save(ctx, cm, r)
+	data, _ := json.Marshal(r)
+	// Uncertainty is permanent even if a competing primary receipt advanced first.
+	patch, _ := json.Marshal([]map[string]any{
+		{"op": "test", "path": "/metadata/uid", "value": string(cm.UID)},
+		{"op": "test", "path": "/data/unknown.json", "value": ""},
+		{"op": "replace", "path": "/data/unknown.json", "value": string(data)},
+	})
+	if err := e.client.Patch(ctx, cm, client.RawPatch(types.JSONPatchType, patch)); err != nil {
+		uncertain, readErr := e.readUnknown(ctx, cm, r)
+		if readErr != nil {
+			return Result{}, readErr
+		}
+		if uncertain != nil {
+			return uncertain.result(e.namespace), nil
+		}
+		return Result{}, err
+	}
+	return r.result(e.namespace), nil
 }
 
 func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.ConfigMap, r receipt, ref metav1.OwnerReference, template *corev1.PodTemplateSpec, authorize bool) (Result, error) {
@@ -262,7 +339,7 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 	} else if err != nil {
 		return Result{}, err
 	}
-	if !sameOwner(&job, ref) || job.Annotations[fingerprintAnnotation] != r.Fingerprint || job.Labels[recordLabel] != cm.Name || job.UID == "" || job.DeletionTimestamp != nil || r.JobUID != "" && job.UID != r.JobUID {
+	if !validJob(&job, r, cm.Name, ref) {
 		return e.unknown(ctx, cm, r, "JobIdentityChanged")
 	}
 	if !r.Dispatched && (job.Spec.Suspend == nil || !*job.Spec.Suspend) {
@@ -273,6 +350,9 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 		return e.save(ctx, cm, r)
 	}
 	if job.Spec.Suspend != nil && *job.Spec.Suspend {
+		if r.PodUID != "" || job.Status.StartTime != nil || job.Status.Active > 0 || job.Status.Succeeded > 0 || job.Status.Failed > 0 {
+			return e.unknown(ctx, cm, r, "ObservedExecutionSuspended")
+		}
 		if !authorize || template == nil {
 			if r.Dispatched {
 				return e.unknown(ctx, cm, r, "AuthorizationChangedDuringDispatch")
@@ -311,6 +391,9 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 		return Result{}, err
 	}
 	if len(pods.Items) > 1 {
+		for _, pod := range pods.Items[:2] {
+			r.ObservedPods = append(r.ObservedPods, corev1.ObjectReference{APIVersion: "v1", Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID})
+		}
 		return e.unknown(ctx, cm, r, "MultipleExecutionPods")
 	}
 	if len(pods.Items) == 0 {
