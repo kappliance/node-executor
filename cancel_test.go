@@ -137,7 +137,7 @@ func TestCancellationAfterInterruptedUnsuspend(t *testing.T) {
 					t.Fatalf("terminal report after withdrawal was lost: %+v", r)
 				}
 			} else {
-				if r.Phase != Unknown || r.Reason != "AuthorizationCancelledDuringDispatch" || r.Job.UID != job.UID {
+				if r.Phase != Pending || r.Reason != "DispatchClaimUnresolved" || r.Job.UID != job.UID {
 					t.Fatalf("ambiguous dispatch was not retained: %+v", r)
 				}
 				f.op.Cancel, f.op.Revision = false, "v2"
