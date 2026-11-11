@@ -20,7 +20,8 @@ import (
 
 // Envtest runs the real API server's validation, UID allocation, and CAS writes.
 // It has no scheduler, Job controller, kubelet, or host activation.
-func TestAPIDispatchAndReceiptConflict(t *testing.T) {
+func apiFixture(t *testing.T) fixture {
+	t.Helper()
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Fatal("set KUBEBUILDER_ASSETS to Kubernetes envtest binaries")
 	}
@@ -58,6 +59,21 @@ func TestAPIDispatchAndReceiptConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := fixture{client: c, executor: New(c, c, ns.Name), owner: owner, op: Operation{Name: "probe", Revision: "v1", Node: corev1.ObjectReference{Name: node.Name, UID: node.UID}, Template: Command(image, "/probe")}}
+	return f
+}
+
+func TestAPIUnknownFencesInFlightSuccessorRelease(t *testing.T) {
+	testUnknownFencesInFlightSuccessorRelease(t, apiFixture(t))
+}
+
+func TestAPIUnknownWinsBeforeDispatchClaim(t *testing.T) {
+	testUnknownWinsBeforeDispatchClaim(t, apiFixture(t))
+}
+
+func TestAPIDispatchAndReceiptConflict(t *testing.T) {
+	f := apiFixture(t)
+	c, owner, ctx := f.client, f.owner, context.Background()
+	ns, node := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: owner.Namespace}}, f.op.Node
 	f.reconcile(t)
 	key := client.ObjectKey{Namespace: ns.Name, Name: ReceiptName(owner.UID, node.UID, f.op.Name)}
 	var first, stale corev1.ConfigMap

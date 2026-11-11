@@ -127,6 +127,9 @@ func (e *Executor) Reconcile(ctx context.Context, owner client.Object, operation
 	if uncertain != nil {
 		return uncertain.result(e.namespace), nil
 	}
+	if result, blocked, err := e.dispatchBlocked(ctx, &cm, r); blocked || err != nil {
+		return result, err
+	}
 	if r.Phase == Failed && r.Reason == "CancelledBeforeDispatch" && r.JobUID == "" {
 		// A concurrent authorized reconcile may create a suspended Job after cancellation.
 		observed, err := e.observe(ctx, owner, &cm, r, ref, nil, false, true)
@@ -272,15 +275,11 @@ func decodeUnknown(cm *corev1.ConfigMap, identity receipt, owner metav1.OwnerRef
 }
 
 func (e *Executor) readUnknown(ctx context.Context, original *corev1.ConfigMap, identity receipt) (*receipt, error) {
-	var current corev1.ConfigMap
-	if err := e.reader.Get(ctx, client.ObjectKeyFromObject(original), &current); err != nil {
+	current, _, err := e.readDispatchReceipt(ctx, original, identity)
+	if err != nil {
 		return nil, err
 	}
-	owner := metav1.GetControllerOf(original)
-	if current.UID != original.UID || owner == nil {
-		return nil, errors.New("execution receipt identity changed")
-	}
-	return decodeUnknown(&current, identity, *owner)
+	return decodeUnknown(current, identity, *metav1.GetControllerOf(original))
 }
 
 func sameOwner(object metav1.Object, expected metav1.OwnerReference) bool {
@@ -298,6 +297,9 @@ func executionObserved(job *batchv1.Job, r receipt) bool {
 }
 
 func (e *Executor) save(ctx context.Context, cm *corev1.ConfigMap, r receipt) (Result, error) {
+	if result, blocked, err := e.dispatchBlocked(ctx, cm, r); blocked || err != nil {
+		return result, err
+	}
 	before := cm.DeepCopy()
 	data, _ := json.Marshal(r)
 	if cm.Data == nil {
@@ -317,28 +319,6 @@ func (e *Executor) save(ctx context.Context, cm *corev1.ConfigMap, r receipt) (R
 				return uncertain.result(e.namespace), nil
 			}
 			return Result{Phase: Pending, Result: ctrl.Result{RequeueAfter: pollInterval}}, nil
-		}
-		return Result{}, err
-	}
-	return r.result(e.namespace), nil
-}
-
-func (e *Executor) unknown(ctx context.Context, cm *corev1.ConfigMap, r receipt, reason string) (Result, error) {
-	r.Phase, r.Reason = Unknown, reason
-	data, _ := json.Marshal(r)
-	// Uncertainty is permanent even if a competing primary receipt advanced first.
-	patch, _ := json.Marshal([]map[string]any{
-		{"op": "test", "path": "/metadata/uid", "value": string(cm.UID)},
-		{"op": "test", "path": "/data/unknown.json", "value": ""},
-		{"op": "replace", "path": "/data/unknown.json", "value": string(data)},
-	})
-	if err := e.client.Patch(ctx, cm, client.RawPatch(types.JSONPatchType, patch)); err != nil {
-		uncertain, readErr := e.readUnknown(ctx, cm, r)
-		if readErr != nil {
-			return Result{}, readErr
-		}
-		if uncertain != nil {
-			return uncertain.result(e.namespace), nil
 		}
 		return Result{}, err
 	}
@@ -419,12 +399,7 @@ func (e *Executor) observe(ctx context.Context, owner client.Object, cm *corev1.
 			r.Dispatched = true
 			return e.save(ctx, cm, r)
 		}
-		before := job.DeepCopy()
-		job.Spec.Suspend = ptr.To(false)
-		if err := e.client.Patch(ctx, &job, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
-			return Result{}, err
-		}
-		return r.result(e.namespace), nil
+		return e.dispatch(ctx, owner, cm, r, &job)
 	}
 	if err := e.checkNode(ctx, r.Node); err != nil {
 		if apierrors.IsNotFound(err) || err.Error() == "target node identity changed" {
